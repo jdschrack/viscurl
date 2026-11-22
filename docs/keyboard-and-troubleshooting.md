@@ -36,7 +36,7 @@ viscurl keeps the last eight results, including failed requests, across all endp
 | --- | --- |
 | **Enter an absolute HTTP(S) server URL** | Edit **Server**. Use a URL such as `http://localhost:8080` and put any required query values in **Extra query** or the documented query fields. |
 | **Set variable … in Variables (v)** | Press **v** and check the key spelling. Use `{{name}}` in request values, or `{name}` when the single token fills the whole **Server** field. |
-| **Could not connect to the server** | Confirm the API is running and that the scheme, hostname, and port match the destination shown in the top bar. |
+| **Could not connect to the server: …** | The text after the colon gives the cause, such as a refused connection or an untrusted certificate. Confirm the API is running and that the scheme, hostname, and port match the destination shown in the top bar. |
 | **401** or **403** | Check the selected **Auth** scheme and the credential's access to that operation. |
 | **Blank body or header input** | Check the selected content type or header parameter for a documented example or default. Open **Body** for an available JSON schema starter, or enter the expected value yourself. |
 | **Response headers are missing from view** | Focus **Response** with **Tab** and press **Enter** until the pane title says **Headers**. |
@@ -45,4 +45,4 @@ viscurl keeps the last eight results, including failed requests, across all endp
 
 ## Supported scope
 
-viscurl reads local OpenAPI 3.0 and 3.1 YAML or JSON files up to 4 MiB. It resolves supported same-file references. Bundle specs with external references before opening them. The request editor supports scalar parameters, form-style query arrays, and JSON or raw text bodies. Response checks cover HTTP status codes. Full schema validation, scripted assertions, file uploads, and saved collections are outside the beta scope.
+viscurl reads local OpenAPI 3.0, 3.1, and 3.2 YAML or JSON files up to 4 MiB. Features added in 3.2, such as the `query` method and `querystring` parameters, are skipped. It resolves supported same-file references. Bundle specs with external references before opening them. The request editor supports scalar parameters, form-style query arrays, and JSON or raw text bodies. Response checks cover HTTP status codes. Full schema validation, scripted assertions, file uploads, and saved collections are outside the beta scope.

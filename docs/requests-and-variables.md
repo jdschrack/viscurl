@@ -37,6 +37,8 @@ For an API that requires multiple schemes together, supply the additional values
 
 Use double braces when combining a token with other text, as in `{{base_url}}/api`. Double-brace tokens also work in parameter values, extra query and header values, the request body, and auth input. Substitution inserts text once. In a JSON body, write the surrounding quotes and give the variable text that produces valid JSON in that position. For example, enter `X-Workspace: {{workspace}}` in **Headers** to reuse a workspace value. An undefined token stops the request and identifies the missing variable.
 
+viscurl fills variables only into text you saved from an editor. Values prefilled from the spec, such as examples and defaults, are sent exactly as written, so a spec file cannot pull your saved variables into a request. To use a token in a prefilled value, open the field and save it.
+
 In the variables table, use **Enter** to edit a value, **r** to rename a key, and **Delete** to remove a row. Edits apply to the current session. To reuse them after restarting, press **Ctrl+S** in the table.
 
 Saved variables are shared across specs and stored as plaintext. The config file is `$XDG_CONFIG_HOME/viscurl/variables.json` when an absolute XDG config directory is set. The usual default is `~/.config/viscurl/variables.json` on Unix-like systems and `%APPDATA%/viscurl/variables.json` on Windows.
