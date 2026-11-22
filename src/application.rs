@@ -421,10 +421,7 @@ mod tests {
         assert_eq!(app.operation().path, "/b");
         let (app, duplicate) = app.start();
         assert!(duplicate.is_none());
-        let app = app
-            .filter(String::new())
-            .move_operation(-1)
-            .finish(Err("offline".into()));
+        let app = app.filter("GET".into()).finish(Err("offline".into()));
         assert_eq!(app.draft().headers, "X-Local: one");
         assert_eq!(app.recent[0].operation, 0);
         assert!(app.pending.is_none());

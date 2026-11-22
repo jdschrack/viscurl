@@ -548,6 +548,56 @@ mod tests {
     }
 
     #[test]
+    fn resolves_draft_tokens_before_wire_encoding_and_keeps_header_boundaries() {
+        let api = spec::parse(include_str!("../../tests/fixtures/pets.yaml")).unwrap();
+        let operation = &api.operations[0];
+        let variables = Variables::parse(
+            r#"{
+            "base_url":"https://example.test/v1",
+            "pet":"fern/42",
+            "account":"A&B",
+            "token":"local-value",
+            "bad":"x\r\nX-Injected: value"
+        }"#,
+        )
+        .unwrap();
+        let draft = Draft::new(operation)
+            .edit(Field::Server, "{{base_url}}".into())
+            .edit(Field::Parameter(0), "{{pet}}".into())
+            .edit(Field::Headers, "X-Account: {{account}}".into())
+            .edit(Field::Query, "account: {{account}}".into())
+            .edit(Field::Body, r#"{"name":"{{pet}}"}"#.into())
+            .cycle(operation, Field::Auth)
+            .edit(Field::Secret, "{{token}}".into());
+
+        let target = super::destination(operation, &draft, &variables).unwrap();
+        let request = super::prepare(operation, &draft, &variables).unwrap();
+        assert_eq!(target.as_str(), "https://example.test/v1/pets/fern%2F42");
+        assert_eq!(request.url.query(), Some("view=full&account=A%26B"));
+        assert_eq!(request.headers["x-account"], "A&B");
+        assert_eq!(request.headers["authorization"], "Bearer local-value");
+        assert_eq!(request.body, r#"{"name":"fern/42"}"#);
+        assert_eq!(draft.server, "{{base_url}}");
+
+        let invalid = draft
+            .clone()
+            .edit(Field::Headers, "X-Account: {{bad}}".into());
+        assert!(
+            super::prepare(operation, &invalid, &variables)
+                .err()
+                .unwrap()
+                .contains("Invalid value")
+        );
+        let missing = draft.edit(Field::Server, "{{missing}}".into());
+        assert!(
+            super::prepare(operation, &missing, &variables)
+                .err()
+                .unwrap()
+                .contains("{{missing}}")
+        );
+    }
+
+    #[test]
     fn builds_request_and_masks_auth_in_destination() {
         let api = spec::parse(include_str!("../../tests/fixtures/pets.yaml")).unwrap();
         let operation = &api.operations[0];
