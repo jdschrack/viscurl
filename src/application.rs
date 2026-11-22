@@ -99,6 +99,13 @@ impl App {
         }
     }
 
+    pub fn clear_message(self) -> Self {
+        Self {
+            message: None,
+            ..self
+        }
+    }
+
     pub fn with_variables(self, variables: Variables) -> Self {
         Self {
             variables,

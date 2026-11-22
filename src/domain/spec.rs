@@ -46,6 +46,7 @@ pub struct Parameter {
 pub struct Body {
     pub media_type: String,
     pub example: String,
+    pub starter: String,
     pub required: bool,
 }
 
@@ -114,11 +115,17 @@ fn example<'a>(
     if let Some(value) = node.get("example") {
         return Ok(Some(value));
     }
-    if let Some(first) = node["examples"]
+    if let Some(example) = node["examples"]
         .as_object()
-        .and_then(|examples| examples.values().next())
+        .into_iter()
+        .flat_map(|examples| examples.values())
+        .find_map(|example| {
+            resolve(root, example)
+                .map(|example| example.get("value"))
+                .transpose()
+        })
     {
-        return resolve(root, first).map(|example| example.get("value"));
+        return example.map(Some);
     }
     let schema = resolve(root, schema)?;
     Ok(schema
@@ -138,6 +145,64 @@ fn format_example(value: &Value, json: bool) -> String {
     value
         .as_str()
         .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+fn schema_starter(
+    root: &Value,
+    schema: &Value,
+    depth: usize,
+    budget: usize,
+) -> Option<(Value, usize)> {
+    let schema = resolve(root, schema).ok()?;
+    let budget = budget.checked_sub(1)?;
+    let kind = schema["type"].as_str().or_else(|| {
+        schema["type"].as_array().and_then(|types| {
+            types
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|kind| *kind != "null")
+        })
+    });
+    let properties = schema["properties"].as_object();
+    // shortcut: starter placeholders cover basic types and local references; schema constraints still need user input
+    if kind == Some("object") || properties.is_some() {
+        let required = schema["required"]
+            .as_array()
+            .filter(|fields| !fields.is_empty());
+        let fields = required
+            .into_iter()
+            .flatten()
+            .filter_map(|name| properties?.get_key_value(name.as_str()?))
+            .chain(
+                properties
+                    .into_iter()
+                    .flatten()
+                    .filter(|_| required.is_none()),
+            )
+            .filter(|(_, field)| field["readOnly"] != true);
+        let (object, budget) = fields.take(if depth == 0 { 0 } else { budget }).try_fold(
+            (serde_json::Map::new(), budget),
+            |(mut object, budget), (name, field)| {
+                if name.len() > EXAMPLE_LIMIT {
+                    return None;
+                }
+                let (value, budget) = schema_starter(root, field, depth - 1, budget)
+                    .or_else(|| budget.checked_sub(1).map(|budget| (Value::Null, budget)))?;
+                object.insert(name.clone(), value);
+                Some((object, budget))
+            },
+        )?;
+        return Some((Value::Object(object), budget));
+    }
+    let value = match kind? {
+        "array" => Value::Array(Vec::new()),
+        "string" => Value::String(String::new()),
+        "integer" | "number" => Value::from(0),
+        "boolean" => Value::Bool(false),
+        "null" => Value::Null,
+        _ => return None,
+    };
+    Some((value, budget))
 }
 
 fn parameter(root: &Value, entry: &Value) -> Result<Parameter, String> {
@@ -311,15 +376,30 @@ fn operation(root: &Value, item: &Value, method: &str, path: &str) -> Result<Ope
         .into_iter()
         .flatten()
         .map(|(media_type, content)| {
-            let json = media_type == "application/json" || media_type.ends_with("+json");
-            let example = example(root, content, &content["schema"])?
-                .map_or_else(String::new, |value| format_example(value, json));
+            let media = media_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let json = media == "application/json" || media.ends_with("+json");
+            let sample = example(root, content, &content["schema"])?;
+            let example = sample.map_or_else(String::new, |value| format_example(value, json));
+            let starter = if sample.is_none() && json {
+                schema_starter(root, &content["schema"], 4, FIELD_LIMIT)
+                    .map(|(value, _)| format_example(&value, true))
+                    .filter(|starter| starter.len() <= EXAMPLE_LIMIT)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             if example.len() > EXAMPLE_LIMIT {
                 return Err("Body example exceeds the 64 KiB import limit".into());
             }
             Ok(Body {
                 media_type: media_type.clone(),
                 example,
+                starter,
                 required: body["required"] == true,
             })
         })
@@ -383,7 +463,7 @@ fn accumulate(
                 + operation
                     .bodies
                     .iter()
-                    .map(|b| b.media_type.len() + b.example.len())
+                    .map(|b| b.media_type.len() + b.example.len() + b.starter.len())
                     .sum::<usize>()
                 + operation
                     .auth
@@ -466,6 +546,40 @@ pub fn parse(source: &str) -> Result<Api, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefills_inline_named_examples_after_external_values() {
+        let api = parse(
+            r#"
+openapi: 3.1.0
+paths:
+  /demo:
+    post:
+      parameters:
+        - name: X-Demo
+          in: header
+          schema: {type: string}
+          examples:
+            external: {externalValue: 'https://example.test/header.txt'}
+            inline: {value: demo-token}
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object, properties: {name: {type: string}}}
+            examples:
+              external: {externalValue: 'https://example.test/body.json'}
+              inline: {value: {name: documented}}
+"#,
+        )
+        .unwrap();
+        let operation = &api.operations[0];
+        assert_eq!(operation.parameters[0].initial, "demo-token");
+        assert_eq!(
+            serde_json::from_str::<Value>(&operation.bodies[0].example).unwrap()["name"],
+            "documented"
+        );
+        assert!(operation.bodies[0].starter.is_empty());
+    }
 
     #[test]
     fn imports_yaml_and_json_with_inheritance_examples_and_references() {
