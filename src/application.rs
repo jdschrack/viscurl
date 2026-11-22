@@ -143,7 +143,7 @@ impl App {
                     operations
                         .iter()
                         .copied()
-                        .filter(move |_| expanded)
+                        .take(if expanded { operations.len() } else { 0 })
                         .map(EndpointRow::Operation),
                 )
             })
@@ -192,6 +192,15 @@ impl App {
         }
         .unwrap_or_default();
         Self { tree_cursor, ..app }
+    }
+
+    pub fn can_send(&self) -> bool {
+        !self.matches.is_empty()
+            && (self.pane != Pane::Endpoints
+                || matches!(
+                    self.tree_rows().nth(self.tree_cursor),
+                    Some(EndpointRow::Operation(_))
+                ))
     }
 
     fn parent_row(&self, parent: &str) -> Option<usize> {
@@ -357,6 +366,50 @@ impl App {
 mod tests {
     use super::*;
     use crate::domain::spec::parse;
+
+    #[test]
+    fn folders_expand_and_collapse_independently_and_restore_after_search() {
+        let app = App::new(parse("openapi: 3.1.0\npaths:\n  /a: {get: {tags: [auth]}}\n  /p: {get: {tags: [patients]}}\n  /s: {get: {tags: [status]}}").unwrap());
+        assert_eq!(app.tree_rows().count(), 3);
+        assert!(!app.can_send());
+
+        let app = app
+            .tree_action(TreeAction::Open)
+            .move_operation(2)
+            .tree_action(TreeAction::Expand);
+        assert_eq!(app.tree_rows().count(), 5);
+        assert!(matches!(
+            app.tree_rows().nth(app.tree_cursor),
+            Some(EndpointRow::Folder {
+                tag: "patients",
+                expanded: true,
+                ..
+            })
+        ));
+
+        let app = app.move_operation(1);
+        assert_eq!(app.operation().path, "/p");
+        assert!(app.can_send());
+        let app = app
+            .tree_action(TreeAction::Collapse)
+            .tree_action(TreeAction::Collapse);
+        assert_eq!(app.tree_rows().count(), 4);
+        let app = app.filter("status".into());
+        assert!(matches!(
+            app.tree_rows().nth(app.tree_cursor),
+            Some(EndpointRow::Operation(_))
+        ));
+        let app = app.filter(String::new());
+        assert_eq!(app.tree_rows().count(), 4);
+        assert!(matches!(
+            app.tree_rows().nth(app.tree_cursor),
+            Some(EndpointRow::Folder {
+                tag: "status",
+                expanded: false,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn keeps_drafts_when_searching_and_attributes_result_to_original_operation() {
