@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize as _},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use std::borrow::Cow;
 
@@ -46,8 +46,8 @@ pub(super) fn safe_char(ch: char) -> char {
 
 fn panel(title: impl Into<Line<'static>>, active: bool) -> Block<'static> {
     let border = if active { ACCENT } else { BORDER };
-    Block::bordered()
-        .border_type(BorderType::Rounded)
+    Block::default()
+        .borders(Borders::TOP)
         .title(title.into().fg(if active { ACCENT } else { MUTED }).bold())
         .border_style(Style::new().fg(border))
         .style(Style::new().fg(TEXT).bg(PANEL))
@@ -355,8 +355,10 @@ fn footer(app: &App) -> Line<'static> {
     }
     let common = if app.pending.is_some() {
         "  Sending…"
-    } else {
+    } else if app.can_send() {
         "  Ctrl+S Send"
+    } else {
+        ""
     };
     let context = match app.pane {
         Pane::Endpoints => "  / Search  Enter Toggle/Open",
@@ -405,7 +407,7 @@ fn modal(frame: &mut Frame<'_>, area: Rect, app: &App, screen: &Screen) {
         Overlay::Help => " Keyboard shortcuts ".to_owned(),
         Overlay::Warnings => format!(" Import warnings · {} ", app.api.warnings.len()),
     };
-    let block = panel(title, true);
+    let block = panel(title, true).borders(Borders::ALL);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     match overlay {
@@ -495,6 +497,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, screen: &Screen) {
             Constraint::Percentage(38),
             Constraint::Percentage(38),
         ])
+        .spacing(1)
         .areas(workspace);
         endpoints(frame, navigation, app);
         request(frame, builder, app);

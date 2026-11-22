@@ -56,7 +56,7 @@ impl Variables {
                     .ok_or_else(|| format!("Set variable {{{{{key}}}}} in Variables (v)"))?;
                 let prefix = &source[end..token.start()];
                 if text.len() + prefix.len() + value.len() > VALUE_LIMIT {
-                    return Err("Expanded request value exceeds 1 MiB".into());
+                    return Err("Expanded request value exceeds 1 MiB".to_owned());
                 }
                 text.push_str(prefix);
                 text.push_str(value);
@@ -67,7 +67,7 @@ impl Variables {
             return Ok(Cow::Borrowed(source));
         }
         if text.len() + source.len() - end > VALUE_LIMIT {
-            return Err("Expanded request value exceeds 1 MiB".into());
+            return Err("Expanded request value exceeds 1 MiB".to_owned());
         }
         text.push_str(&source[end..]);
         Ok(Cow::Owned(text))

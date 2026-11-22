@@ -258,21 +258,21 @@ fn handle(app: App, screen: &mut Screen, input: Event) -> Action {
                             app.with_message("Edited text exceeds 1 MiB".into()),
                         );
                     }
-                    if edit == Edit::Variables {
-                        return match Variables::parse(&value) {
+                    return match edit {
+                        Edit::Search => {
+                            screen.overlay = None;
+                            screen.reset_response();
+                            Action::Continue(app.filter(value).focus(Pane::Endpoints))
+                        }
+                        Edit::Request(field) => {
+                            screen.overlay = None;
+                            Action::Continue(app.edit(field, value))
+                        }
+                        Edit::Variables => match Variables::parse(&value) {
                             Ok(variables) => Action::SaveVariables(app, variables),
                             Err(error) => Action::Continue(app.with_message(error)),
-                        };
-                    }
-                    screen.overlay = None;
-                    return Action::Continue(match edit {
-                        Edit::Search => {
-                            screen.reset_response();
-                            app.filter(value)
-                        }
-                        Edit::Request(field) => app.edit(field, value),
-                        Edit::Variables => unreachable!("variables have their own save action"),
-                    });
+                        },
+                    };
                 }
                 if key.is_some_and(|key| key.code == KeyCode::Esc) {
                     screen.overlay = None;
@@ -297,7 +297,7 @@ fn handle(app: App, screen: &mut Screen, input: Event) -> Action {
     let Some(key) = key else {
         return Action::Continue(app);
     };
-    if control(key, 's') && !app.matches().is_empty() {
+    if control(key, 's') && app.can_send() {
         return Action::Send(app);
     }
     let step = match key.code {
