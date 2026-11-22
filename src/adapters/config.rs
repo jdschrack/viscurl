@@ -1,8 +1,8 @@
+use super::file;
 use crate::domain::variables::{CONFIG_LIMIT, Variables};
 use std::{
-    env,
-    fs::{self, File},
-    io::{self, Read, Write},
+    env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -21,20 +21,11 @@ pub fn path() -> Option<PathBuf> {
 }
 
 pub fn load(path: &Path) -> Result<Variables, String> {
-    match path.metadata() {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err("Variables configuration must be a regular file".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Variables::default()),
-        Err(error) => return Err(error.to_string()),
+    match file::read(path, CONFIG_LIMIT) {
+        Ok(text) => Variables::parse(&text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Variables::default()),
+        Err(error) => Err(error.to_string()),
     }
-    let mut text = String::new();
-    File::open(path)
-        .and_then(|file| {
-            file.take((CONFIG_LIMIT + 1) as u64)
-                .read_to_string(&mut text)
-        })
-        .map_err(|error| error.to_string())?;
-    Variables::parse(&text)
 }
 
 pub fn save(path: &Path, variables: &Variables) -> io::Result<()> {

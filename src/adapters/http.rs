@@ -1,5 +1,6 @@
 use crate::domain::request::{Request, Response};
 use reqwest::{Method, blocking::Client, redirect::Policy};
+use std::error::Error as _;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
@@ -29,12 +30,14 @@ pub fn send(client: &Client, request: Request) -> Result<Response, String> {
     .send()
     .map_err(|error| {
         if error.is_timeout() {
-            "Request timed out"
-        } else if error.is_connect() {
+            return "Request timed out".to_owned();
+        }
+        let summary = if error.is_connect() {
             "Could not connect to the server"
         } else {
             "Could not complete the HTTP request"
-        }
+        };
+        format!("{summary}: {}", root_cause(&error))
     })?;
     let status = response.status().as_u16();
     let headers = response
@@ -66,6 +69,13 @@ pub fn send(client: &Client, request: Request) -> Result<Response, String> {
         })?;
     let elapsed_ms = started.elapsed().as_millis();
     Ok(preview(status, elapsed_ms, headers, &bytes))
+}
+
+// The innermost error names the real reason (refused, DNS, certificate) and never holds the URL.
+fn root_cause(error: &reqwest::Error) -> String {
+    std::iter::successors(error.source(), |&error| error.source())
+        .last()
+        .map_or_else(|| "unknown error".to_owned(), ToString::to_string)
 }
 
 fn preview(
@@ -107,5 +117,48 @@ mod tests {
         assert!(response.truncated);
         assert_eq!(response.raw.len(), PREVIEW_LIMIT);
         assert!(response.pretty.is_none());
+    }
+
+    fn request(url: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            url: url.parse().unwrap(),
+            headers: Default::default(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn shows_redirects_as_responses_masks_cookies_and_explains_refused_connections() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start?key=hidden", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 1024]).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /next\r\nSet-Cookie: sid=secret\r\n\
+                      Content-Length: 2\r\nConnection: close\r\n\r\nhi",
+                )
+                .unwrap();
+        });
+        let response = send(&client().unwrap(), request(&url)).unwrap();
+        server.join().unwrap();
+        assert_eq!((response.status, response.raw.as_str()), (302, "hi"));
+        let header = |name| {
+            response
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("location"), Some("/next"));
+        assert_eq!(header("set-cookie"), Some("[masked]"));
+
+        // The listener is closed now, so the same port refuses the connection.
+        let error = send(&client().unwrap(), request(&url)).err().unwrap();
+        assert!(error.starts_with("Could not connect to the server: "));
+        assert!(!error.contains("hidden"));
     }
 }

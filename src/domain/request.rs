@@ -3,6 +3,7 @@ use super::variables::{VALUE_LIMIT, Variables};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use std::borrow::Cow;
 use url::Url;
 
 const URL_LIMIT: usize = 64 * 1024;
@@ -11,6 +12,13 @@ const COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
+
+fn fits_url(bytes: usize) -> Result<(), String> {
+    if bytes > URL_LIMIT {
+        return Err("Request URL exceeds 64 KiB".into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -32,7 +40,8 @@ pub struct Draft {
     pub headers: String,
     pub media: usize,
     pub body: String,
-    body_edited: bool,
+    // Fields the user saved from an editor; only their text gets saved variables filled in.
+    edited: Vec<Field>,
     pub auth: usize,
     pub secret: String,
 }
@@ -53,7 +62,7 @@ impl Draft {
                 .bodies
                 .first()
                 .map_or_else(String::new, |body| body.example.clone()),
-            body_edited: false,
+            edited: Vec::new(),
             auth: 0,
             secret: String::new(),
         }
@@ -72,7 +81,7 @@ impl Draft {
     }
 
     pub fn body_starter<'a>(&self, operation: &'a Operation) -> Option<&'a str> {
-        if self.body_edited || !self.body.is_empty() {
+        if self.edited.contains(&Field::Body) || !self.body.is_empty() {
             return None;
         }
         operation
@@ -82,7 +91,40 @@ impl Draft {
             .filter(|starter| !starter.is_empty())
     }
 
+    fn unedited(self, field: Field) -> Self {
+        Self {
+            edited: self
+                .edited
+                .into_iter()
+                .filter(|&edited| edited != field)
+                .collect(),
+            ..self
+        }
+    }
+
+    // Spec-supplied text stays literal, so an untrusted spec cannot pull saved variables into a request.
+    fn expand<'a>(
+        &self,
+        field: Field,
+        value: &'a str,
+        variables: &Variables,
+    ) -> Result<Cow<'a, str>, String> {
+        if !self.edited.contains(&field) {
+            return Ok(value.into());
+        }
+        variables.expand(value)
+    }
+
     pub fn edit(self, field: Field, value: String) -> Self {
+        let draft = self.unedited(field);
+        let draft = Self {
+            edited: draft.edited.iter().copied().chain([field]).collect(),
+            ..draft
+        };
+        draft.replace(field, value)
+    }
+
+    fn replace(self, field: Field, value: String) -> Self {
         match field {
             Field::Server => Self {
                 server: value,
@@ -113,7 +155,6 @@ impl Draft {
             },
             Field::Body => Self {
                 body: value,
-                body_edited: true,
                 ..self
             },
             Field::Secret => Self {
@@ -132,7 +173,8 @@ impl Draft {
                     .iter()
                     .position(|server| server == &self.server)
                     .map_or(0, |index| (index + 1) % operation.servers.len());
-                self.edit(field, operation.servers[next].clone())
+                self.unedited(field)
+                    .replace(field, operation.servers[next].clone())
             }
             Field::Media => {
                 let media = (self.media + 1) % (operation.bodies.len() + 1);
@@ -142,17 +184,13 @@ impl Draft {
                         .get(index)
                         .map_or("", |body: &super::spec::Body| body.example.as_str())
                 };
-                let replace = self.body == example(self.media);
-                let body = if replace {
-                    example(media).to_owned()
-                } else {
-                    self.body
-                };
+                if self.body != example(self.media) {
+                    return Self { media, ..self };
+                }
                 Self {
                     media,
-                    body,
-                    body_edited: self.body_edited && !replace,
-                    ..self
+                    body: example(media).to_owned(),
+                    ..self.unedited(Field::Body)
                 }
             }
             Field::Auth => Self {
@@ -174,11 +212,21 @@ impl Draft {
         &'a self,
         operation: &'a Operation,
     ) -> impl Iterator<Item = (&'a Parameter, &'a str)> + Clone + 'a {
+        self.parameter_fields(operation)
+            .map(|(_, parameter, value)| (parameter, value))
+    }
+
+    fn parameter_fields<'a>(
+        &'a self,
+        operation: &'a Operation,
+    ) -> impl Iterator<Item = (Field, &'a Parameter, &'a str)> + Clone + 'a {
         operation
             .parameters
             .iter()
             .zip(self.parameters.iter().map(String::as_str))
-            .filter(|(_, value)| !value.is_empty())
+            .enumerate()
+            .filter(|(_, (_, value))| !value.is_empty())
+            .map(|(index, (parameter, value))| (Field::Parameter(index), parameter, value))
     }
 
     pub fn has_query(&self, operation: &Operation) -> bool {
@@ -223,7 +271,11 @@ pub fn destination(
     draft: &Draft,
     variables: &Variables,
 ) -> Result<Url, String> {
-    let server = variables.expand_server(&draft.server)?;
+    let server = if draft.edited.contains(&Field::Server) {
+        variables.expand_server(&draft.server)?
+    } else {
+        draft.server.as_str().into()
+    };
     if server.trim().chars().any(char::is_control) {
         return Err("Server URL contains a control character".into());
     }
@@ -243,9 +295,7 @@ pub fn destination(
         String::new(),
         |mut path, segment| -> Result<_, String> {
             let segment = expand_segment(operation, draft, variables, segment)?;
-            if path.len() + segment.len() + 1 > URL_LIMIT {
-                return Err("Request URL exceeds 64 KiB".into());
-            }
+            fits_url(path.len() + segment.len() + 1)?;
             path.push('/');
             path.push_str(&segment);
             Ok(path)
@@ -253,9 +303,7 @@ pub fn destination(
     )?;
     let mut url = server;
     url.set_path(&format!("{}{}", url.path().trim_end_matches('/'), path));
-    if url.as_str().len() > URL_LIMIT {
-        return Err("Request URL exceeds 64 KiB".into());
-    }
+    fits_url(url.as_str().len())?;
     Ok(url)
 }
 
@@ -276,26 +324,24 @@ fn expand_segment(
                 return Ok(expanded);
             };
             let key = key.strip_suffix('}').ok_or("Unclosed path parameter")?;
-            let (parameter, value) = draft
-                .parameters(operation)
-                .find(|(param, _)| param.location == Location::Path && param.name == key)
+            let (field, parameter, value) = draft
+                .parameter_fields(operation)
+                .find(|(_, param, _)| param.location == Location::Path && param.name == key)
                 .ok_or_else(|| format!("Fill in path parameter {key}"))?;
-            let expanded_value = variables.expand(value)?;
+            let expanded_value = draft.expand(field, value, variables)?;
             if expanded_value.is_empty() {
                 return Err(format!("Fill in path parameter {key}"));
             }
             let value = match parameter.encoding {
                 Encoding::Manual if !expanded_value.contains('/') => {
-                    std::borrow::Cow::Borrowed(expanded_value.as_ref())
+                    Cow::Borrowed(expanded_value.as_ref())
                 }
                 Encoding::Manual => {
                     return Err(format!("Encode '/' as %2F in path parameter {key}"));
                 }
                 _ => utf8_percent_encode(&expanded_value, COMPONENT).into(),
             };
-            if expanded.len() + literal.len() + value.len() > URL_LIMIT {
-                return Err("Request URL exceeds 64 KiB".into());
-            }
+            fits_url(expanded.len() + literal.len() + value.len())?;
             expanded.push_str(literal);
             expanded.push_str(&value);
             Ok(expanded)
@@ -386,9 +432,7 @@ fn encode_query(value: &str) -> String {
 
 fn append_query(mut query: String, key: &str, escaped: &str) -> Result<String, String> {
     let key = encode_query(key);
-    if query.len() + key.len() + escaped.len() + 2 > URL_LIMIT {
-        return Err("Request URL exceeds 64 KiB".into());
-    }
+    fits_url(query.len() + key.len() + escaped.len() + 2)?;
     if !query.is_empty() {
         query.push('&');
     }
@@ -424,28 +468,33 @@ fn query_field(query: String, parameter: &Parameter, value: &str) -> Result<Stri
     append_query(query, &parameter.name, &value)
 }
 
-pub fn prepare(
-    operation: &Operation,
-    draft: &Draft,
+type Credential<'a> = (Location, &'a str, &'a str);
+type Values<'a> = [(&'a Parameter, Cow<'a, str>)];
+
+fn secret<'a>(
+    auth: Option<&AuthOption>,
+    draft: &'a Draft,
     variables: &Variables,
-) -> Result<Request, String> {
-    let mut url = destination(operation, draft, variables)?;
-    let auth = draft.auth_option(operation);
-    let secret = if auth.is_some() {
-        variables.expand(&draft.secret)?
-    } else {
-        "".into()
-    };
-    let auth_key = auth.and_then(|option| match option.kind {
-        AuthKind::ApiKey(location) => Some((location, option.key.as_str(), secret.as_ref())),
-        _ => None,
-    });
-    if auth.is_some() && secret.is_empty() {
+) -> Result<Cow<'a, str>, String> {
+    if auth.is_none() {
+        return Ok("".into());
+    }
+    let secret = variables.expand(&draft.secret)?;
+    if secret.is_empty() {
         return Err("Enter credentials for the selected authentication scheme".into());
     }
-    let (parameters, _) = draft
-        .parameters(operation)
-        .filter(|(parameter, _)| {
+    Ok(secret)
+}
+
+fn parameter_values<'a>(
+    operation: &'a Operation,
+    draft: &'a Draft,
+    variables: &Variables,
+    auth_key: Option<Credential<'_>>,
+) -> Result<Vec<(&'a Parameter, Cow<'a, str>)>, String> {
+    draft
+        .parameter_fields(operation)
+        .filter(|(_, parameter, _)| {
             parameter.location != Location::Path
                 && !auth_key.is_some_and(|(location, key, _)| {
                     parameter.location == location && parameter.name == key
@@ -453,90 +502,132 @@ pub fn prepare(
         })
         .try_fold(
             (Vec::new(), 0),
-            |(mut fields, bytes), (parameter, value)| -> Result<_, String> {
-                let value = variables.expand(value)?;
+            |(mut fields, bytes), (field, parameter, value)| -> Result<_, String> {
+                let value = draft.expand(field, value, variables)?;
                 let bytes = add_expanded_bytes(bytes, &value)?;
                 if !value.is_empty() {
                     fields.push((parameter, value));
                 }
                 Ok((fields, bytes))
             },
-        )?;
-    let parameters = parameters
-        .iter()
-        .map(|(parameter, value)| (*parameter, value.as_ref()));
+        )
+        .map(|(fields, _)| fields)
+}
+
+fn query_string(
+    draft: &Draft,
+    variables: &Variables,
+    parameters: &Values<'_>,
+    auth_key: Option<Credential<'_>>,
+) -> Result<String, String> {
     let query = parameters
-        .clone()
+        .iter()
         .filter(|(parameter, _)| parameter.location == Location::Query)
         .try_fold(String::new(), |query, (parameter, value)| {
             query_field(query, parameter, value)
         })?;
     let query_auth = auth_key.filter(|(location, _, _)| *location == Location::Query);
-    let query = pairs(&draft.query, "Extra query", variables)?
+    pairs(&draft.query, "Extra query", variables)?
         .into_iter()
         .filter(|(key, _)| !query_auth.is_some_and(|(_, name, _)| key == name))
         .chain(query_auth.map(|(_, key, value)| (key.to_owned(), value.to_owned())))
         .try_fold(query, |query, (key, value)| {
             append_query(query, &key, &encode_query(&value))
-        })?;
-    if url.as_str().len() + query.len() + usize::from(!query.is_empty()) > URL_LIMIT {
-        return Err("Request URL exceeds 64 KiB".into());
-    }
-    if !query.is_empty() {
-        url.set_query(Some(&query));
-    }
-    let fields =
-        parameters.map(|(parameter, value)| (parameter.location, parameter.name.as_str(), value));
+        })
+}
 
-    let headers = pairs(&draft.headers, "Headers", variables)?;
-    let mut headers: HeaderMap = fields
+fn request_headers<'a>(
+    draft: &Draft,
+    variables: &Variables,
+    parameters: &'a Values<'a>,
+    auth_key: Option<Credential<'a>>,
+) -> Result<HeaderMap, String> {
+    let typed = pairs(&draft.headers, "Headers", variables)?;
+    let fields = parameters
+        .iter()
+        .map(|(parameter, value)| (parameter.location, parameter.name.as_str(), value.as_ref()));
+    let mut headers = fields
         .clone()
         .filter(|(location, _, _)| *location == Location::Header)
         .map(|(_, key, value)| (key.to_owned(), value.to_owned()))
-        .chain(headers)
+        .chain(typed)
         .map(header)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .collect();
-    let cookies = fields
-        .chain(auth_key)
-        .filter(|(location, _, _)| *location == Location::Cookie)
-        .map(|(_, key, value)| cookie(key, value))
+        .collect::<Result<HeaderMap, _>>()?;
+    // Servers may read only the first Cookie header, so typed and documented cookies share one.
+    let cookies = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .chain(
+            fields
+                .chain(auth_key)
+                .filter(|(location, _, _)| *location == Location::Cookie)
+                .map(|(_, key, value)| cookie(key, value).into_bytes()),
+        )
         .collect::<Vec<_>>()
-        .join("; ");
-    if !cookies.is_empty() {
-        headers.append(
-            http::header::COOKIE,
-            HeaderValue::from_str(&cookies).map_err(|_| "Invalid cookie")?,
-        );
+        .join(&b"; "[..]);
+    if cookies.is_empty() {
+        return Ok(headers);
     }
-    if let Some(auth) = auth {
-        let authorization = match auth.kind {
-            AuthKind::Basic => {
-                if !secret.contains(':') {
-                    return Err("Basic authentication uses username:password".into());
-                }
-                Some(format!("Basic {}", STANDARD.encode(secret.as_bytes())))
-            }
-            AuthKind::Bearer => Some(format!("Bearer {secret}")),
-            AuthKind::ApiKey(_) => None,
-        };
-        let auth_header = authorization
-            .map(|value| ("Authorization".to_owned(), value))
-            .or_else(|| {
-                auth_key
-                    .filter(|(location, _, _)| *location == Location::Header)
-                    .map(|(_, key, value)| (key.to_owned(), value.to_owned()))
-            });
-        if let Some(pair) = auth_header {
-            let (name, mut value) = header(pair)?;
-            value.set_sensitive(true);
-            headers.insert(name, value);
+    headers.insert(
+        http::header::COOKIE,
+        HeaderValue::from_bytes(&cookies).map_err(|_| "Invalid cookie")?,
+    );
+    Ok(headers)
+}
+
+fn authorization(
+    auth: Option<&AuthOption>,
+    secret: &str,
+    auth_key: Option<Credential<'_>>,
+) -> Result<Option<(String, String)>, String> {
+    let Some(auth) = auth else {
+        return Ok(None);
+    };
+    let value = match auth.kind {
+        AuthKind::Basic if !secret.contains(':') => {
+            return Err("Basic authentication uses username:password".into());
         }
+        AuthKind::Basic => format!("Basic {}", STANDARD.encode(secret.as_bytes())),
+        AuthKind::Bearer => format!("Bearer {secret}"),
+        AuthKind::ApiKey(_) => {
+            return Ok(auth_key
+                .filter(|(location, _, _)| *location == Location::Header)
+                .map(|(_, key, value)| (key.to_owned(), value.to_owned())));
+        }
+    };
+    Ok(Some(("Authorization".to_owned(), value)))
+}
+
+pub fn prepare(
+    operation: &Operation,
+    draft: &Draft,
+    variables: &Variables,
+) -> Result<Request, String> {
+    let mut url = destination(operation, draft, variables)?;
+    let auth = draft.auth_option(operation);
+    let secret = secret(auth, draft, variables)?;
+    let auth_key = auth.and_then(|option| match option.kind {
+        AuthKind::ApiKey(location) => Some((location, option.key.as_str(), secret.as_ref())),
+        _ => None,
+    });
+    let parameters = parameter_values(operation, draft, variables, auth_key)?;
+    let query = query_string(draft, variables, &parameters, auth_key)?;
+    fits_url(url.as_str().len() + query.len() + usize::from(!query.is_empty()))?;
+    if !query.is_empty() {
+        url.set_query(Some(&query));
     }
-    let payload = variables.expand(&draft.body)?;
+    let mut headers = request_headers(draft, variables, &parameters, auth_key)?;
+    if let Some(pair) = authorization(auth, &secret, auth_key)? {
+        let (name, mut value) = header(pair)?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    let payload = draft.expand(Field::Body, &draft.body, variables)?;
     if let Some(body) = operation.bodies.get(draft.media)
         && !headers.contains_key(http::header::CONTENT_TYPE)
+        // A media range such as */* describes what the server accepts; it is not a sendable type.
+        && !body.media_type.contains('*')
         && (!payload.is_empty() || body.required)
     {
         let (name, value) = header(("Content-Type".into(), body.media_type.clone()))?;
@@ -722,6 +813,12 @@ paths: {/pets: {get: {}}}
             prepare(operation, &draft).unwrap().headers["cookie"],
             "sid=abc%3B%3D"
         );
+        let typed = draft.clone().edit(Field::Headers, "Cookie: other=1".into());
+        let request = prepare(operation, &typed).unwrap();
+        assert_eq!(
+            request.headers.get_all("cookie").iter().collect::<Vec<_>>(),
+            ["other=1; sid=abc%3B%3D"]
+        );
         let draft = draft.cycle(operation, Field::Auth);
         assert!(prepare(operation, &draft).is_err());
         let draft = draft.edit(Field::Secret, "name:pass".into());
@@ -729,6 +826,43 @@ paths: {/pets: {get: {}}}
             prepare(operation, &draft).unwrap().headers["authorization"],
             "Basic bmFtZTpwYXNz"
         );
+    }
+
+    #[test]
+    fn keeps_spec_supplied_tokens_literal_until_the_user_edits_the_field() {
+        let api = spec::parse(
+            r#"
+openapi: 3.1.0
+servers: [{url: 'https://example.test'}]
+paths:
+  /pets:
+    post:
+      parameters: [{name: q, in: query, example: '{{token}}'}]
+      requestBody: {content: {'*/*': {example: 'body={{token}}'}}}
+"#,
+        )
+        .unwrap();
+        let operation = &api.operations[0];
+        let variables = Variables::parse(r#"{"token":"S3CRET"}"#).unwrap();
+        let draft = Draft::new(operation);
+        let request = super::prepare(operation, &draft, &variables).unwrap();
+        assert!(!format!("{}{}", request.url, request.body).contains("S3CRET"));
+        assert_eq!(request.body, "body={{token}}");
+        // A media range is not a type the client can claim to send.
+        assert!(!request.headers.contains_key("content-type"));
+
+        let draft = draft
+            .edit(Field::Parameter(0), "{{token}}".into())
+            .edit(Field::Body, "{{token}}".into());
+        let request = super::prepare(operation, &draft, &variables).unwrap();
+        assert_eq!(request.url.query(), Some("q=S3CRET"));
+        assert_eq!(request.body, "S3CRET");
+        // Cycling back to a spec server makes the field spec-supplied again.
+        let draft = draft
+            .edit(Field::Server, "https://{{token}}.test".into())
+            .cycle(operation, Field::Server);
+        let request = super::prepare(operation, &draft, &variables).unwrap();
+        assert_eq!(request.url.host_str(), Some("example.test"));
     }
 
     #[test]

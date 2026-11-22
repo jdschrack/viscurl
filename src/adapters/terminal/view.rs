@@ -244,11 +244,7 @@ fn request(frame: &mut Frame<'_>, rect: Rect, app: &App) {
 }
 
 fn exchange<'a>(app: &'a App, screen: &Screen) -> Option<&'a Result<Response, String>> {
-    app.recent
-        .iter()
-        .filter(|item| item.operation == app.selected)
-        .nth(screen.history)
-        .map(|item| &item.result)
+    app.history().nth(screen.history).map(|item| &item.result)
 }
 
 pub(super) fn response_text<'a>(app: &'a App, screen: &Screen) -> Cow<'a, str> {
@@ -284,11 +280,7 @@ fn response(frame: &mut Frame<'_>, rect: Rect, app: &App, screen: &Screen) {
     if app.matches().is_empty() {
         return;
     }
-    let total = app
-        .recent
-        .iter()
-        .filter(|item| item.operation == app.selected)
-        .count();
+    let total = app.history().count();
     let summary = match exchange(app, screen) {
         Some(Ok(result)) => {
             let color = if result.status < 300 {

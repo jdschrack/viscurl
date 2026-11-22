@@ -4,8 +4,7 @@ mod domain;
 
 use std::{
     env,
-    fs::File,
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal},
     path::Path,
     process::ExitCode,
 };
@@ -14,24 +13,7 @@ const SPEC_LIMIT: usize = 4 * 1024 * 1024;
 const USAGE: &str = "Usage: viscurl <openapi.yaml|openapi.json>";
 
 fn load(path: &Path) -> Result<domain::spec::Api, String> {
-    if !path
-        .metadata()
-        .map_err(|error| format!("Cannot open specification: {error}"))?
-        .is_file()
-    {
-        return Err("The specification must be a regular file".into());
-    }
-    let mut source = String::new();
-    let file = File::open(path).map_err(|error| format!("Cannot open specification: {error}"))?;
-    if !file
-        .metadata()
-        .map_err(|error| error.to_string())?
-        .is_file()
-    {
-        return Err("The specification must be a regular file".into());
-    }
-    file.take((SPEC_LIMIT + 1) as u64)
-        .read_to_string(&mut source)
+    let source = adapters::file::read(path, SPEC_LIMIT)
         .map_err(|error| format!("Cannot read specification: {error}"))?;
     if source.len() > SPEC_LIMIT {
         return Err("The specification exceeds the 4 MiB import limit".into());

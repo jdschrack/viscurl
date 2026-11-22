@@ -129,6 +129,22 @@ impl App {
         )
     }
 
+    /// Results for the selected operation, newest first.
+    pub fn history(&self) -> impl Iterator<Item = &Exchange> {
+        self.recent
+            .iter()
+            .filter(|item| item.operation == self.selected)
+    }
+
+    // Moving to another operation starts at its first field.
+    fn field_for(&self, operation: usize) -> usize {
+        if operation == self.selected {
+            self.field
+        } else {
+            0
+        }
+    }
+
     fn open_folders(&self) -> &BTreeSet<String> {
         self.search_expanded.as_ref().unwrap_or(&self.expanded)
     }
@@ -222,11 +238,7 @@ impl App {
             Some(EndpointRow::Operation(index)) => index,
             _ => self.selected,
         };
-        let field = if endpoint == self.selected {
-            self.field
-        } else {
-            0
-        };
+        let field = self.field_for(endpoint);
         Self {
             tree_cursor,
             selected: endpoint,
@@ -270,11 +282,7 @@ impl App {
             Some(EndpointRow::Operation(index))
                 if matches!(action, TreeAction::Open | TreeAction::Expand) =>
             {
-                let field = if self.selected == index {
-                    self.field
-                } else {
-                    0
-                };
+                let field = self.field_for(index);
                 Self {
                     selected: index,
                     field,

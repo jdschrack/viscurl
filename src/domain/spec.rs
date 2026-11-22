@@ -337,26 +337,51 @@ fn authentication(root: &Value, operation: &Value) -> Vec<AuthOption> {
     declared.into_iter().chain(fallback).collect()
 }
 
+fn media(root: &Value, media_type: &str, content: &Value, required: bool) -> Result<Body, String> {
+    let media = media_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let json = media == "application/json" || media.ends_with("+json");
+    let sample = example(root, content, &content["schema"])?;
+    let example = sample.map_or_else(String::new, |value| format_example(value, json));
+    let starter = if sample.is_none() && json {
+        schema_starter(root, &content["schema"], 4, FIELD_LIMIT)
+            .map(|(value, _)| format_example(&value, true))
+            .filter(|starter| starter.len() <= EXAMPLE_LIMIT)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if example.len() > EXAMPLE_LIMIT {
+        return Err("Body example exceeds the 64 KiB import limit".into());
+    }
+    Ok(Body {
+        media_type: media_type.to_owned(),
+        example,
+        starter,
+        required,
+    })
+}
+
 fn operation(root: &Value, item: &Value, method: &str, path: &str) -> Result<Operation, String> {
     let node = &item[method];
     if !node.is_object() {
         return Err("Operation must be an object".into());
     }
     let body = resolve(root, &node["requestBody"])?;
-    let count = [item, node]
-        .into_iter()
-        .filter_map(|value| value["parameters"].as_array())
-        .map(Vec::len)
-        .sum::<usize>()
-        + body["content"]
-            .as_object()
-            .map_or(0, |content| content.len());
-    if count > FIELD_LIMIT {
-        return Err("Operation exceeds the 128-field import limit".into());
-    }
-    let parameters = [item, node]
+    let content = body["content"].as_object();
+    let entries = [item, node]
         .into_iter()
         .flat_map(|value| value["parameters"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    if entries.len() + content.map_or(0, |content| content.len()) > FIELD_LIMIT {
+        return Err("Operation exceeds the 128-field import limit".into());
+    }
+    let parameters = entries
+        .into_iter()
         .map(|value| parameter(root, value))
         .try_fold(Vec::<Parameter>::new(), |mut parameters, next| {
             let next = next?;
@@ -371,38 +396,10 @@ fn operation(root: &Value, item: &Value, method: &str, path: &str) -> Result<Ope
             parameters.push(next);
             Ok::<_, String>(parameters)
         })?;
-    let bodies = body["content"]
-        .as_object()
+    let bodies = content
         .into_iter()
         .flatten()
-        .map(|(media_type, content)| {
-            let media = media_type
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            let json = media == "application/json" || media.ends_with("+json");
-            let sample = example(root, content, &content["schema"])?;
-            let example = sample.map_or_else(String::new, |value| format_example(value, json));
-            let starter = if sample.is_none() && json {
-                schema_starter(root, &content["schema"], 4, FIELD_LIMIT)
-                    .map(|(value, _)| format_example(&value, true))
-                    .filter(|starter| starter.len() <= EXAMPLE_LIMIT)
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            if example.len() > EXAMPLE_LIMIT {
-                return Err("Body example exceeds the 64 KiB import limit".into());
-            }
-            Ok(Body {
-                media_type: media_type.clone(),
-                example,
-                starter,
-                required: body["required"] == true,
-            })
-        })
+        .map(|(media_type, content)| media(root, media_type, content, body["required"] == true))
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Operation {
         method: method.to_ascii_uppercase(),
@@ -446,29 +443,24 @@ fn accumulate(
         }
         Ok(operation) => {
             let size = size
-                + operation.path.len()
-                + operation.summary.len()
-                + operation.tag.len()
-                + operation
-                    .servers
-                    .iter()
+                + [&operation.path, &operation.summary, &operation.tag]
+                    .into_iter()
+                    .chain(&operation.servers)
                     .chain(&operation.statuses)
-                    .map(String::len)
-                    .sum::<usize>()
-                + operation
-                    .parameters
-                    .iter()
-                    .map(|p| p.name.len() + p.initial.len())
-                    .sum::<usize>()
-                + operation
-                    .bodies
-                    .iter()
-                    .map(|b| b.media_type.len() + b.example.len() + b.starter.len())
-                    .sum::<usize>()
-                + operation
-                    .auth
-                    .iter()
-                    .map(|a| a.label.len() + a.key.len())
+                    .chain(
+                        operation
+                            .parameters
+                            .iter()
+                            .flat_map(|p| [&p.name, &p.initial]),
+                    )
+                    .chain(
+                        operation
+                            .bodies
+                            .iter()
+                            .flat_map(|b| [&b.media_type, &b.example, &b.starter]),
+                    )
+                    .chain(operation.auth.iter().flat_map(|a| [&a.label, &a.key]))
+                    .map(|text| text.len())
                     .sum::<usize>();
             operations.push(operation);
             size
@@ -494,9 +486,11 @@ pub fn parse(source: &str) -> Result<Api, String> {
     let root: Value = serde_saphyr::from_str_with_options(source, options)
         .map_err(|error| format!("Cannot parse OpenAPI: {error}"))?;
     let version = text(&root["openapi"]);
-    if !matches!(version.split('.').collect::<Vec<_>>().as_slice(), ["3", "0" | "1", patch] if patch.parse::<u32>().is_ok())
+    if !matches!(version.split('.').collect::<Vec<_>>().as_slice(), ["3", "0" | "1" | "2", patch] if patch.parse::<u32>().is_ok())
     {
-        return Err(format!("Expected OpenAPI 3.0 or 3.1, found {version:?}"));
+        return Err(format!(
+            "Expected OpenAPI 3.0, 3.1, or 3.2, found {version:?}"
+        ));
     }
     let paths = root["paths"]
         .as_object()

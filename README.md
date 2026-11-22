@@ -10,7 +10,7 @@ From a checkout of this repository, run the app in an interactive terminal.
 cargo run --locked -- ./openapi.yaml
 ```
 
-viscurl reads local OpenAPI 3.0 and 3.1 files in YAML or JSON. Press **?** for keyboard help and **Ctrl+S** to send a request.
+viscurl reads local OpenAPI 3.0, 3.1, and 3.2 files in YAML or JSON. Press **?** for keyboard help and **Ctrl+S** to send a request.
 
 ## User guides
 

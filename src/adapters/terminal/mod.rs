@@ -67,9 +67,13 @@ struct Screen {
 }
 
 impl Screen {
-    fn reset_response(&mut self) {
+    fn scroll_top(&mut self) {
         self.row = 0;
         self.column = 0;
+    }
+
+    fn reset_response(&mut self) {
+        self.scroll_top();
         self.history = 0;
     }
 }
@@ -220,23 +224,16 @@ fn response_key(app: &App, screen: &mut Screen, key: KeyCode, step: Option<isize
         }
         KeyCode::Enter => {
             screen.tab = screen.tab.next();
-            screen.row = 0;
-            screen.column = 0;
+            screen.scroll_top();
         }
         KeyCode::Char('[' | ']') => {
-            let latest = app
-                .recent
-                .iter()
-                .filter(|item| item.operation == app.selected)
-                .count()
-                .saturating_sub(1);
+            let latest = app.history().count().saturating_sub(1);
             screen.history = if key == KeyCode::Char('[') {
                 (screen.history + 1).min(latest)
             } else {
                 screen.history.saturating_sub(1)
             };
-            screen.row = 0;
-            screen.column = 0;
+            screen.scroll_top();
         }
         _ => {}
     }
