@@ -1,0 +1,18 @@
+[package]
+name = "viscurl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde-saphyr = "0.0"
+percent-encoding = "2"
+url = "2"
+base64 = "0.22"
+ratatui-textarea = "0.9"
+http = "1"
+regex = "1"
+tempfile = "3"

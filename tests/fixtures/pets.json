@@ -1,0 +1,26 @@
+{
+  "openapi": "3.0.4",
+  "info": {"title":"Pet shelter","version":"1"},
+  "servers":[{"url":"http://localhost:{port}/api","variables":{"port":{"default":"8080"}}}],
+  "security":[{"shelterToken":[]}],
+  "paths":{
+    "/pets/{id}":{
+      "parameters":[
+        {"$ref":"#/components/parameters/PetId"},
+        {"name":"view","in":"query","schema":{"type":"string","default":"summary"}}
+      ],
+      "post":{
+        "tags":["Pets"],
+        "summary":"Update a pet",
+        "parameters":[{"name":"view","in":"query","schema":{"type":"string"},"example":"full"}],
+        "requestBody":{"$ref":"#/components/requestBodies/Pet"},
+        "responses":{"200":{"description":"Updated"},"4XX":{"description":"Invalid request"}}
+      }
+    }
+  },
+  "components":{
+    "parameters":{"PetId":{"name":"id","in":"path","required":true,"schema":{"type":"integer","default":42}}},
+    "requestBodies":{"Pet":{"content":{"application/json":{"example":{"name":"Fern"}}}}},
+    "securitySchemes":{"shelterToken":{"type":"http","scheme":"bearer"}}
+  }
+}
