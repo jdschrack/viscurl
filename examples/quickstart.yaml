@@ -1,0 +1,22 @@
+openapi: 3.1.0
+info:
+  title: viscurl quickstart
+  version: '1.0.0'
+servers:
+  - url: http://127.0.0.1:8765
+paths:
+  /hello.json:
+    get:
+      tags: [Quickstart]
+      summary: Read a greeting
+      responses:
+        '200':
+          description: A greeting
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    type: string

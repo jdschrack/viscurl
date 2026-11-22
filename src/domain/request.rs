@@ -32,6 +32,7 @@ pub struct Draft {
     pub headers: String,
     pub media: usize,
     pub body: String,
+    body_edited: bool,
     pub auth: usize,
     pub secret: String,
 }
@@ -52,6 +53,7 @@ impl Draft {
                 .bodies
                 .first()
                 .map_or_else(String::new, |body| body.example.clone()),
+            body_edited: false,
             auth: 0,
             secret: String::new(),
         }
@@ -67,6 +69,17 @@ impl Draft {
             Field::Secret => &self.secret,
             Field::Media | Field::Auth => "",
         }
+    }
+
+    pub fn body_starter<'a>(&self, operation: &'a Operation) -> Option<&'a str> {
+        if self.body_edited || !self.body.is_empty() {
+            return None;
+        }
+        operation
+            .bodies
+            .get(self.media)
+            .map(|body| body.starter.as_str())
+            .filter(|starter| !starter.is_empty())
     }
 
     pub fn edit(self, field: Field, value: String) -> Self {
@@ -100,6 +113,7 @@ impl Draft {
             },
             Field::Body => Self {
                 body: value,
+                body_edited: true,
                 ..self
             },
             Field::Secret => Self {
@@ -128,7 +142,8 @@ impl Draft {
                         .get(index)
                         .map_or("", |body: &super::spec::Body| body.example.as_str())
                 };
-                let body = if self.body == example(self.media) {
+                let replace = self.body == example(self.media);
+                let body = if replace {
                     example(media).to_owned()
                 } else {
                     self.body
@@ -136,6 +151,7 @@ impl Draft {
                 Self {
                     media,
                     body,
+                    body_edited: self.body_edited && !replace,
                     ..self
                 }
             }
@@ -207,7 +223,7 @@ pub fn destination(
     draft: &Draft,
     variables: &Variables,
 ) -> Result<Url, String> {
-    let server = variables.expand(&draft.server)?;
+    let server = variables.expand_server(&draft.server)?;
     if server.trim().chars().any(char::is_control) {
         return Err("Server URL contains a control character".into());
     }
@@ -545,6 +561,33 @@ mod tests {
 
     fn destination(operation: &Operation, draft: &Draft) -> Result<Url, String> {
         super::destination(operation, draft, &Variables::default())
+    }
+
+    #[test]
+    fn accepts_single_brace_server_variable_in_preview_and_request() {
+        let api = spec::parse(include_str!("../../tests/fixtures/pets.yaml")).unwrap();
+        let operation = &api.operations[0];
+        let variables =
+            Variables::parse(r#"{"base_url":"http://localhost:8080","bad":"file:///tmp"}"#)
+                .unwrap();
+        let draft = Draft::new(operation).edit(Field::Server, "{base_url}".into());
+        let target = super::destination(operation, &draft, &variables).unwrap();
+        assert_eq!(target.as_str(), "http://localhost:8080/pets/42");
+        let request = super::prepare(operation, &draft, &variables).unwrap();
+        assert_eq!(
+            request.url.as_str(),
+            "http://localhost:8080/pets/42?view=full"
+        );
+        assert_eq!(variables.expand("{base_url}").unwrap(), "{base_url}");
+
+        let missing = draft.clone().edit(Field::Server, "{missing}".into());
+        assert!(
+            super::destination(operation, &missing, &variables)
+                .unwrap_err()
+                .contains("{missing}")
+        );
+        let invalid = draft.edit(Field::Server, "{bad}".into());
+        assert!(super::destination(operation, &invalid, &variables).is_err());
     }
 
     #[test]

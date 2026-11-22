@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize as _},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Row, Table, Wrap},
 };
 use std::borrow::Cow;
 
@@ -212,6 +212,7 @@ fn request(frame: &mut Frame<'_>, rect: Rect, app: &App) {
                     }
                 }
                 Field::Body if !draft.body.is_empty() => &body_size,
+                Field::Body if draft.body_starter(op).is_some() => "Schema starter",
                 Field::Headers | Field::Query if !draft.value(field).is_empty() => "[set]",
                 _ => draft.value(field),
             };
@@ -379,14 +380,70 @@ fn footer(app: &App) -> Line<'static> {
     ])
 }
 
+fn variables(frame: &mut Frame<'_>, area: Rect, app: &App, screen: &Screen) {
+    let [list, actions] = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(area);
+    let entries = app.variables.entries();
+    let total = entries.len();
+    if total == 0 {
+        frame.render_widget(
+            Paragraph::new("Press a to add your first variable.").fg(MUTED),
+            list,
+        );
+    } else {
+        let visible = usize::from(list.height.saturating_sub(1));
+        let start = window(total, screen.variable_row, visible);
+        let rows = entries
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, (key, value))| {
+                let marker = if index == screen.variable_row {
+                    "› "
+                } else {
+                    "  "
+                };
+                let preview = match value.split_once('\n') {
+                    Some((first, _)) => format!("{} ↵", safe(first)),
+                    None if value.is_empty() => "—".to_owned(),
+                    None => safe(value),
+                };
+                let row = Row::new([format!("{marker}{key}"), preview]);
+                if index == screen.variable_row {
+                    return row.style(Style::new().bg(SELECTED).bold());
+                }
+                row
+            });
+        let table = Table::new(rows, [Constraint::Percentage(38), Constraint::Fill(1)])
+            .header(Row::new(["  Key", "Value"]).style(Style::new().fg(ACCENT).bold()));
+        frame.render_widget(table, list);
+    }
+    let shortcuts = if actions.width >= 44 {
+        "a Add  ·  Enter Edit  ·  r Rename  ·  Del Remove"
+    } else {
+        "a Add ↵ Edit r Key Del"
+    };
+    let actions_text = Text::from(vec![
+        Line::styled(shortcuts, Style::new().fg(MUTED)),
+        Line::from(vec![
+            Span::styled("Ctrl+S Save  Esc Close", Style::new().fg(ACCENT)),
+            Span::raw(
+                screen
+                    .variable_status
+                    .map_or_else(String::new, |status| format!("  ·  {status}")),
+            ),
+        ]),
+    ]);
+    frame.render_widget(Paragraph::new(actions_text), actions);
+}
+
 fn modal(frame: &mut Frame<'_>, area: Rect, app: &App, screen: &Screen) {
     let Some(overlay) = &screen.overlay else {
         return;
     };
     let width = area.width.saturating_sub(4).min(78);
     let height = match overlay {
-        Overlay::Editor(edit, _) if !multiline(*edit) => 5,
-        Overlay::Editor(..) => 19,
+        Overlay::Editor(edit, _) if !multiline(edit) => 5,
+        Overlay::Editor(..) | Overlay::Variables => 19,
         Overlay::Help => 15,
         Overlay::Warnings => 13,
     }
@@ -400,7 +457,15 @@ fn modal(frame: &mut Frame<'_>, area: Rect, app: &App, screen: &Screen) {
     frame.render_widget(Clear, rect);
     let title = match overlay {
         Overlay::Editor(Edit::Search, _) => " Search endpoints ".to_owned(),
-        Overlay::Editor(Edit::Variables, _) => " Variables ".to_owned(),
+        Overlay::Variables => " Variables ".to_owned(),
+        Overlay::Editor(Edit::VariableName(None), _) => " Add variable · Key ".to_owned(),
+        Overlay::Editor(Edit::VariableName(Some(_)), _) => " Rename variable · Key ".to_owned(),
+        Overlay::Editor(Edit::VariableValue(name), _) => format!(" Value · {} ", safe(name)),
+        Overlay::Editor(Edit::Request(Field::Body), _)
+            if app.draft().body_starter(app.operation()).is_some() =>
+        {
+            " Body · schema starter ".to_owned()
+        }
         Overlay::Editor(Edit::Request(field), _) => {
             format!(" {} ", safe(&field_label(app, *field)))
         }
@@ -416,7 +481,10 @@ fn modal(frame: &mut Frame<'_>, area: Rect, app: &App, screen: &Screen) {
                 Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
             frame.render_widget(editor.as_ref(), content);
             let help = match edit {
-                Edit::Variables => "JSON string pairs  ·  Ctrl+S Save  ·  Esc Cancel",
+                Edit::VariableName(None) => "Enter Next  ·  Esc Cancel",
+                Edit::VariableName(Some(_)) | Edit::VariableValue(_) => {
+                    "Enter Apply  ·  Esc Cancel"
+                }
                 Edit::Request(Field::Headers | Field::Query) => {
                     "One name: value per line  ·  Ctrl+S Save  ·  Esc Cancel"
                 }
@@ -425,6 +493,7 @@ fn modal(frame: &mut Frame<'_>, area: Rect, app: &App, screen: &Screen) {
             };
             frame.render_widget(Paragraph::new(help).fg(MUTED), hint);
         }
+        Overlay::Variables => variables(frame, inner, app, screen),
         Overlay::Help => {
             let help = "Tab / Shift+Tab   Focus the next or previous pane\n↑↓ / PgUp / PgDn   Move or scroll\n/                 Search methods, paths, summaries and tags\nEsc               Close a dialog or clear the search\nEnter             Toggle folder, open endpoint, edit field or cycle view\n← →               Fold/unfold, cycle options, or scroll response\nCtrl+S            Save editor or send request\n[ / ]             Older or newer response for this endpoint\nv                 Edit shared request variables\n!                 Show import warnings\nq / Ctrl+C        Quit\n* Required by spec  ·  † Complex parameter, see README";
             frame.render_widget(

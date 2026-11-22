@@ -3,7 +3,7 @@ mod view;
 use crate::{
     adapters::{config, http},
     application::{App, Pane, TreeAction},
-    domain::{request::Field, spec::Api, variables::Variables},
+    domain::{request::Field, spec::Api},
 };
 use crossterm::{
     event::{
@@ -21,15 +21,17 @@ use std::{io, sync::mpsc, thread, time::Duration};
 
 const MAX_EDIT_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Edit {
     Search,
-    Variables,
+    VariableName(Option<String>),
+    VariableValue(String),
     Request(Field),
 }
 
 enum Overlay {
     Editor(Edit, Box<TextArea<'static>>),
+    Variables,
     Help,
     Warnings,
 }
@@ -60,6 +62,8 @@ struct Screen {
     column: usize,
     history: usize,
     warning_row: usize,
+    variable_row: usize,
+    variable_status: Option<&'static str>,
 }
 
 impl Screen {
@@ -85,14 +89,14 @@ fn fields(app: &App) -> Vec<Field> {
         .collect()
 }
 
-fn multiline(edit: Edit) -> bool {
+fn multiline(edit: &Edit) -> bool {
     matches!(
         edit,
-        Edit::Variables | Edit::Request(Field::Query | Field::Headers | Field::Body)
+        Edit::VariableValue(_) | Edit::Request(Field::Query | Field::Headers | Field::Body)
     )
 }
 
-fn editor_text(edit: Edit, value: &str) -> String {
+fn editor_text(edit: &Edit, value: &str) -> String {
     if multiline(edit) {
         return value
             .replace("\r\n", "\n")
@@ -112,7 +116,7 @@ fn editor_text(edit: Edit, value: &str) -> String {
 
 fn editor(edit: Edit, value: &str) -> Overlay {
     let mut area = TextArea::new(
-        editor_text(edit, value)
+        editor_text(&edit, value)
             .split('\n')
             .map(str::to_owned)
             .collect(),
@@ -133,7 +137,7 @@ fn editor(edit: Edit, value: &str) -> Overlay {
     Overlay::Editor(edit, Box::new(area))
 }
 
-fn edit_event(edit: Edit, area: &mut TextArea<'_>, input: &Event) {
+fn edit_event(edit: &Edit, area: &mut TextArea<'_>, input: &Event) {
     let bytes = area
         .lines()
         .iter()
@@ -182,7 +186,15 @@ fn request_key(app: App, screen: &mut Screen, key: KeyCode, step: Option<isize>)
             return app.cycle(field);
         }
         let draft = app.draft();
-        screen.overlay = Some(editor(Edit::Request(field), draft.value(field)));
+        let starter = if field == Field::Body {
+            draft.body_starter(app.operation())
+        } else {
+            None
+        };
+        screen.overlay = Some(editor(
+            Edit::Request(field),
+            starter.unwrap_or_else(|| draft.value(field)),
+        ));
     }
     app
 }
@@ -233,8 +245,133 @@ fn response_key(app: &App, screen: &mut Screen, key: KeyCode, step: Option<isize
 enum Action {
     Continue(App),
     Send(App),
-    SaveVariables(App, Variables),
+    SaveVariables(App),
     Quit,
+}
+
+fn navigation_step(code: KeyCode) -> Option<isize> {
+    match code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        KeyCode::PageUp => Some(-10),
+        KeyCode::PageDown => Some(10),
+        _ => None,
+    }
+}
+
+fn variable_row_key(app: App, screen: &mut Screen, key: KeyEvent) -> Action {
+    if control(key, 's') {
+        return Action::SaveVariables(app);
+    }
+    if let Some(step) = navigation_step(key.code) {
+        screen.variable_row = screen
+            .variable_row
+            .saturating_add_signed(step)
+            .min(app.variables.entries().len().saturating_sub(1));
+        return Action::Continue(app);
+    }
+    let entry = app.variables.entries().nth(screen.variable_row);
+    let app = match key.code {
+        KeyCode::Esc | KeyCode::Char('v') => {
+            screen.overlay = None;
+            app
+        }
+        KeyCode::Char('a') => {
+            screen.overlay = Some(editor(Edit::VariableName(None), ""));
+            app
+        }
+        KeyCode::Enter => {
+            if let Some((name, value)) = entry {
+                screen.overlay = Some(editor(Edit::VariableValue(name.to_owned()), value));
+            }
+            app
+        }
+        KeyCode::Char('r') => {
+            if let Some((name, _)) = entry {
+                screen.overlay = Some(editor(Edit::VariableName(Some(name.to_owned())), name));
+            }
+            app
+        }
+        KeyCode::Delete => {
+            if let Some((name, _)) = entry {
+                let variables = app.variables.remove(name);
+                screen.variable_row = screen
+                    .variable_row
+                    .min(variables.entries().len().saturating_sub(1));
+                screen.variable_status = Some("Session changes");
+                app.with_variables(variables)
+            } else {
+                app
+            }
+        }
+        _ => app,
+    };
+    Action::Continue(app)
+}
+
+fn apply_variable(
+    app: App,
+    screen: &mut Screen,
+    previous: Option<&str>,
+    name: String,
+    value: String,
+) -> Action {
+    if previous == Some(name.as_str()) && app.variables.value(&name) == Some(value.as_str()) {
+        screen.overlay = Some(Overlay::Variables);
+        return Action::Continue(app.clear_message());
+    }
+    match app.variables.set(previous, name.clone(), value) {
+        Ok(variables) => {
+            screen.variable_row = variables
+                .entries()
+                .position(|(key, _)| key == name)
+                .unwrap_or_default();
+            screen.variable_status = Some("Session changes");
+            screen.overlay = Some(Overlay::Variables);
+            Action::Continue(app.with_variables(variables))
+        }
+        Err(error) => Action::Continue(app.with_message(error)),
+    }
+}
+
+fn apply_edit(app: App, screen: &mut Screen, edit: Edit, value: String) -> Action {
+    if value.len() > MAX_EDIT_BYTES {
+        return Action::Continue(app.with_message("Edited text exceeds 1 MiB".into()));
+    }
+    match edit {
+        Edit::Search => {
+            screen.overlay = None;
+            screen.reset_response();
+            Action::Continue(app.filter(value).focus(Pane::Endpoints))
+        }
+        Edit::Request(field) => {
+            screen.overlay = None;
+            Action::Continue(app.edit(field, value))
+        }
+        Edit::VariableName(previous) => {
+            let name = value.trim().to_owned();
+            if let Some(previous) = previous {
+                let value = app
+                    .variables
+                    .value(&previous)
+                    .unwrap_or_default()
+                    .to_owned();
+                return apply_variable(app, screen, Some(&previous), name, value);
+            }
+            if let Err(error) = app.variables.check_name(&name, None) {
+                return Action::Continue(app.with_message(error));
+            }
+            screen.overlay = Some(editor(Edit::VariableValue(name), ""));
+            Action::Continue(app.clear_message())
+        }
+        Edit::VariableValue(ref name) => {
+            let value = match app.variables.value(name) {
+                Some(original) if editor_text(&edit, original) == value => original.to_owned(),
+                _ => value,
+            };
+            apply_variable(app, screen, Some(name), name.clone(), value)
+        }
+    }
 }
 
 fn handle(app: App, screen: &mut Screen, input: Event) -> Action {
@@ -249,35 +386,26 @@ fn handle(app: App, screen: &mut Screen, input: Event) -> Action {
         match overlay {
             Overlay::Editor(edit, area) => {
                 if key.is_some_and(|key| {
-                    control(key, 's') || (key.code == KeyCode::Enter && !multiline(*edit))
+                    control(key, 's')
+                        || (key.code == KeyCode::Enter
+                            && (!multiline(edit)
+                                || (key.modifiers.is_empty()
+                                    && matches!(edit, Edit::VariableValue(_)))))
                 }) {
-                    let edit = *edit;
+                    let edit = edit.clone();
                     let value = area.lines().join("\n");
-                    if value.len() > MAX_EDIT_BYTES {
-                        return Action::Continue(
-                            app.with_message("Edited text exceeds 1 MiB".into()),
-                        );
-                    }
-                    return match edit {
-                        Edit::Search => {
-                            screen.overlay = None;
-                            screen.reset_response();
-                            Action::Continue(app.filter(value).focus(Pane::Endpoints))
-                        }
-                        Edit::Request(field) => {
-                            screen.overlay = None;
-                            Action::Continue(app.edit(field, value))
-                        }
-                        Edit::Variables => match Variables::parse(&value) {
-                            Ok(variables) => Action::SaveVariables(app, variables),
-                            Err(error) => Action::Continue(app.with_message(error)),
-                        },
-                    };
+                    return apply_edit(app, screen, edit, value);
                 }
                 if key.is_some_and(|key| key.code == KeyCode::Esc) {
-                    screen.overlay = None;
-                } else {
-                    edit_event(*edit, area, &input);
+                    let variable = matches!(edit, Edit::VariableName(_) | Edit::VariableValue(_));
+                    screen.overlay = variable.then_some(Overlay::Variables);
+                    return Action::Continue(if variable { app.clear_message() } else { app });
+                }
+                edit_event(edit, area, &input);
+            }
+            Overlay::Variables => {
+                if let Some(key) = key {
+                    return variable_row_key(app, screen, key);
                 }
             }
             Overlay::Help | Overlay::Warnings => match key.map(|key| key.code) {
@@ -300,13 +428,7 @@ fn handle(app: App, screen: &mut Screen, input: Event) -> Action {
     if control(key, 's') && app.can_send() {
         return Action::Send(app);
     }
-    let step = match key.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        KeyCode::PageUp => Some(-10),
-        KeyCode::PageDown => Some(10),
-        _ => None,
-    };
+    let step = navigation_step(key.code);
     Action::Continue(match key.code {
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Tab | KeyCode::BackTab => {
@@ -318,7 +440,7 @@ fn handle(app: App, screen: &mut Screen, input: Event) -> Action {
             app
         }
         KeyCode::Char('v') => {
-            screen.overlay = Some(editor(Edit::Variables, &app.variables.json()));
+            screen.overlay = Some(Overlay::Variables);
             app
         }
         KeyCode::Char('?') => {
@@ -390,13 +512,13 @@ fn event_loop(
         app = match handle(app, &mut screen, event::read()?) {
             Action::Continue(app) => app,
             Action::Quit => return Ok(()),
-            Action::SaveVariables(app, variables) => {
+            Action::SaveVariables(app) => {
                 match config_path.as_ref().map_err(Clone::clone).and_then(|path| {
-                    config::save(path, &variables).map_err(|error| error.to_string())
+                    config::save(path, &app.variables).map_err(|error| error.to_string())
                 }) {
                     Ok(()) => {
-                        screen.overlay = None;
-                        app.with_variables(variables)
+                        screen.variable_status = Some("Saved to config");
+                        app.clear_message()
                     }
                     Err(error) => app.with_message(format!("Cannot save variables: {error}")),
                 }
@@ -440,11 +562,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opens_schema_starter_without_adding_it_to_the_request_until_saved() {
+        let api = crate::domain::spec::parse(
+            r#"
+openapi: 3.1.0
+servers: [{url: 'http://localhost:8080'}]
+paths:
+  /login:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Login'}
+components:
+  schemas:
+    Login:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string}
+        password: {type: string}
+        optional: {type: boolean}
+"#,
+        )
+        .unwrap();
+        let app = App::new(api).focus(Pane::Request);
+        let field = fields(&app)
+            .iter()
+            .position(|&field| field == Field::Body)
+            .unwrap();
+        let app = app.select_field(field);
+        let mut screen = Screen::default();
+        let app = request_key(app, &mut screen, KeyCode::Enter, None);
+        let Some(Overlay::Editor(_, editor)) = &screen.overlay else {
+            panic!("body editor should open");
+        };
+        let sample = editor.lines().join("\n");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sample).unwrap(),
+            serde_json::json!({"email": "", "password": ""})
+        );
+        assert!(app.draft().body.is_empty());
+
+        let save = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let Action::Continue(app) = handle(app, &mut screen, save) else {
+            panic!("saving should update the body");
+        };
+        let (_, request) = app.start();
+        assert_eq!(request.unwrap().body, sample);
+    }
+
+    #[test]
+    fn saves_multiline_json_with_real_newlines_and_preserves_string_escapes() {
+        let api =
+            crate::domain::spec::parse(include_str!("../../../tests/fixtures/pets.yaml")).unwrap();
+        let mut screen = Screen {
+            overlay: Some(editor(Edit::Request(Field::Body), "")),
+            ..Screen::default()
+        };
+        let key = |code, modifiers| Event::Key(KeyEvent::new(code, modifiers));
+        let events = [
+            Event::Paste("{\r\n".into()),
+            Event::Paste(r#"  "name": "Fern\nOak""#.into()),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            Event::Paste("}".into()),
+            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        ];
+        let app = events.into_iter().fold(App::new(api), |app, event| {
+            match handle(app, &mut screen, event) {
+                Action::Continue(app) => app,
+                _ => panic!("saving the editor should update the request draft"),
+            }
+        });
+        let (_, request) = app.start();
+        let request = request.unwrap();
+        assert_eq!(request.body, "{\n  \"name\": \"Fern\\nOak\"\n}");
+        assert_eq!(request.headers["content-type"], "application/json");
+        let json: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(json["name"], "Fern\nOak");
+    }
+
+    #[test]
+    fn variables_editor_adds_edits_renames_and_removes_until_explicit_save() {
+        let api =
+            crate::domain::spec::parse(include_str!("../../../tests/fixtures/pets.yaml")).unwrap();
+        let mut screen = Screen::default();
+        let mut input = |app, event| match handle(app, &mut screen, event) {
+            Action::Continue(app) => app,
+            _ => panic!("edits should only change the session"),
+        };
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let text = |text: &str| Event::Paste(text.to_owned());
+        let app = [
+            key(KeyCode::Char('v')),
+            key(KeyCode::Char('a')),
+            text("base_url"),
+            key(KeyCode::Enter),
+            text("http://localhost:3000"),
+            key(KeyCode::Enter),
+            key(KeyCode::Char('a')),
+            text("mode"),
+            key(KeyCode::Enter),
+            text("staging"),
+            key(KeyCode::Enter),
+            key(KeyCode::Char('r')),
+            text("_name"),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            text("-local"),
+            key(KeyCode::Enter),
+            key(KeyCode::Up),
+            key(KeyCode::Delete),
+            key(KeyCode::Esc),
+            key(KeyCode::Char('v')),
+        ]
+        .into_iter()
+        .fold(App::new(api), &mut input);
+        assert_eq!(
+            app.variables.entries().collect::<Vec<_>>(),
+            [("mode_name", "staging-local")]
+        );
+        assert_eq!(screen.variable_status, Some("Session changes"));
+        let save = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            handle(app, &mut screen, save),
+            Action::SaveVariables(_)
+        ));
+    }
+
+    #[test]
     fn multiline_editor_keeps_tabs_and_normalizes_pasted_line_endings() {
         assert_eq!(
-            editor_text(Edit::Request(Field::Body), "a\tb\r\nc\u{1b}"),
+            editor_text(&Edit::Request(Field::Body), "a\tb\r\nc\u{1b}"),
             "a\tb\nc�"
         );
-        assert_eq!(editor_text(Edit::Search, "line\nbreak"), "line break");
+        assert_eq!(editor_text(&Edit::Search, "line\nbreak"), "line break");
     }
 }
